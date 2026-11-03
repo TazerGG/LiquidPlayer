@@ -23,6 +23,7 @@ class AppViewModel @Inject constructor(
     private val favorites: FavoritesRepository,
     private val folderPlaylists: CreatePlaylistFromFolderUseCase,
     private val controller: PlayerController,
+    private val updates: UpdateRepository,
 ) : ViewModel() {
 
     val settings = settingsRepository.settings.stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
@@ -33,13 +34,19 @@ class AppViewModel @Inject constructor(
     val scanState = libraryRepository.scanState
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 16)
-    val messages: Flow<String> = merge(controller.events, _messages)
+    val messages: Flow<String> = merge(controller.events, _messages, updates.messages)
+
+    val updateState = updates.state
+    val updatePrompt = updates.promptVisible
+    val currentVersion = updates.currentVersion
 
     val pendingAdd = MutableStateFlow<List<Song>?>(null)
     val scanDialog = MutableStateFlow<ScanResult?>(null)
 
     init {
         controller.connect()
+        // Atualização é OPCIONAL: só avisa (no máx. 1x/dia) e só se o usuário não desligou a verificação.
+        viewModelScope.launch { if (settingsRepository.current().autoCheckUpdates) updates.autoCheckIfDue() }
         viewModelScope.launch {
             libraryRepository.scanResults.collect { r ->
                 if (r.hasIssues || (r.isNewFolder && r.totalFiles > 0)) scanDialog.value = r
@@ -83,6 +90,22 @@ class AppViewModel @Inject constructor(
     }
 
     fun dismissAdd() { pendingAdd.value = null }
+
+    fun downloadUpdate() = updates.startDownload()
+    fun cancelDownload() = updates.cancelDownload()
+    fun installUpdate(activityContext: android.content.Context) = updates.install(activityContext)
+    fun openReleasePage(activityContext: android.content.Context) = updates.openReleasePage(activityContext)
+    fun dismissUpdatePrompt() = updates.dismissPrompt()
+    fun skipUpdate() {
+        val info = when (val s = updates.state.value) {
+            is UpdateState.Available -> s.info
+            is UpdateState.Downloading -> s.info
+            is UpdateState.Downloaded -> s.info
+            is UpdateState.Failed -> s.info
+            else -> null
+        } ?: return
+        viewModelScope.launch { updates.skip(info.versionName) }
+    }
     fun dismissScan() { scanDialog.value = null }
 
     fun createFromScan(result: ScanResult, mode: FolderPlaylistMode) {

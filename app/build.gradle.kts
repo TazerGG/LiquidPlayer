@@ -1,9 +1,18 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
+}
+
+// Opcional: crie "keystore.properties" na raiz para assinar o APK de release com a SUA chave
+// (a mesma chave deve ser usada em todas as versões, senão o Android recusa a atualização).
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -16,10 +25,27 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+
+        // Repositório do GitHub cujas Releases serão consultadas pelo atualizador.
+        // Troque pelos seus dados (ex.: owner = "tazerg", repo = "LiquidPlayer"). Repositório precisa ser PÚBLICO.
+        buildConfigField("String", "GITHUB_OWNER", "\"TazerGG\"")
+        buildConfigField("String", "GITHUB_REPO", "\"LiquidPlayer\"")
+    }
+
+    signingConfigs {
+        if (keystoreProps.containsKey("storeFile")) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.findByName("release")
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
@@ -29,7 +55,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
 }
 

@@ -68,6 +68,7 @@ data class AppSettings(
     val restoreQueue: Boolean = true,
     val pauseOnUnplug: Boolean = true,
     val skipBrokenTracks: Boolean = true,
+    val autoCheckUpdates: Boolean = true,
 )
 
 /** Resultado de uma varredura de pasta. */
@@ -90,3 +91,14 @@ data class ScanResult(
 }
 
 data class FolderPlaylistOutcome(val created: Int, val updated: Int, val songsAdded: Int)
+
+/** Release do GitHub mais nova que a versão instalada. */
+data class UpdateInfo(
+    val versionName: String,
+    val title: String,
+    val notes: String,
+    val pageUrl: String,
+    val apkUrl: String?,
+    val apkSizeBytes: Long,
+    val sha256: String?,
+)

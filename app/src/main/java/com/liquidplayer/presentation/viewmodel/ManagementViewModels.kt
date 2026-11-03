@@ -98,10 +98,16 @@ class SettingsViewModel @Inject constructor(
     private val history: HistoryRepository,
     library: LibraryRepository,
     private val libraryRepo: LibraryRepository,
+    private val updates: UpdateRepository,
 ) : ViewModel() {
     val settings = settingsRepository.settings.stateIn(viewModelScope, SharingStarted.Eagerly, AppSettings())
     val unavailable = library.observeUnavailableCount().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0)
     val message = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val updateState = updates.state
+    val currentVersion = updates.currentVersion
+
+    fun checkUpdates() = updates.check(manual = true)
+    fun showUpdate() = updates.showPrompt()
 
     fun set(key: String, value: Any) { viewModelScope.launch { settingsRepository.set(key, value) } }
     fun clearHistory() { viewModelScope.launch { history.clear(); message.emit("Histórico limpo.") } }

@@ -8,12 +8,16 @@ import com.liquidplayer.domain.model.RepeatMode
 import com.liquidplayer.domain.model.Song
 import java.io.File
 
+/** Uma posição da fila. [queued] = adicionada manualmente pelo usuário (toca antes do restante do contexto). */
+data class QueueEntry(val key: String, val song: Song, val queued: Boolean)
+
 data class PlayerState(
     val currentSong: Song? = null,
     val isPlaying: Boolean = false,
     val isBuffering: Boolean = false,
     val durationMs: Long = 0L,
     val queue: List<Song> = emptyList(),
+    val entries: List<QueueEntry> = emptyList(),
     val currentIndex: Int = -1,
     val shuffle: Boolean = false,
     val repeat: RepeatMode = RepeatMode.OFF,

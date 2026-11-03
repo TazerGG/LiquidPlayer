@@ -22,12 +22,18 @@ object PrefKeys {
     const val RESTORE_QUEUE = "play.restore_queue"
     const val PAUSE_UNPLUG = "play.pause_unplug"
     const val SKIP_BROKEN = "play.skip_broken"
+    const val UPDATE_AUTO = "update.auto"
+    const val UPDATE_LAST_CHECK = "update.last_check"
+    const val UPDATE_SKIPPED = "update.skipped_version"
 
     // estado do player (persistido para restaurar após reiniciar)
     const val PLAYER_INDEX_SONG = "state.current_song_id"
     const val PLAYER_POSITION = "state.position_ms"
     const val PLAYER_SHUFFLE = "state.shuffle"
     const val PLAYER_REPEAT = "state.repeat"
+    const val PLAYER_INDEX = "state.current_index"
+    const val QUEUED_POSITIONS = "state.queued_positions"
+    const val ORIGINAL_ORDER = "state.original_order"
 }
 
 /** Preferências salvas em uma tabela chave/valor do Room (persistem após reiniciar o app). */
@@ -47,6 +53,7 @@ class SettingsRepository @Inject constructor(private val dao: PreferenceDao) {
             restoreQueue = m[PrefKeys.RESTORE_QUEUE]?.toBooleanStrictOrNull() ?: d.restoreQueue,
             pauseOnUnplug = m[PrefKeys.PAUSE_UNPLUG]?.toBooleanStrictOrNull() ?: d.pauseOnUnplug,
             skipBrokenTracks = m[PrefKeys.SKIP_BROKEN]?.toBooleanStrictOrNull() ?: d.skipBrokenTracks,
+            autoCheckUpdates = m[PrefKeys.UPDATE_AUTO]?.toBooleanStrictOrNull() ?: d.autoCheckUpdates,
         )
     }.distinctUntilChanged()
 

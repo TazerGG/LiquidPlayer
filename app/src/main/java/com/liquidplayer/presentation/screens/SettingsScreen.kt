@@ -22,6 +22,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.liquidplayer.data.repository.PrefKeys
+import com.liquidplayer.data.repository.UpdateState
 import com.liquidplayer.domain.model.CornerStyle
 import com.liquidplayer.domain.model.ThemeMode
 import com.liquidplayer.presentation.components.*
@@ -34,6 +35,7 @@ import com.liquidplayer.presentation.viewmodel.SettingsViewModel
 fun SettingsScreen(onOpenFolders: () -> Unit, vm: SettingsViewModel = hiltViewModel()) {
     val s by vm.settings.collectAsStateWithLifecycle()
     val unavailable by vm.unavailable.collectAsStateWithLifecycle()
+    val updateState by vm.updateState.collectAsStateWithLifecycle()
     val show = LocalShowMessage.current
     LaunchedEffect(Unit) { vm.message.collect { show(it) } }
 
@@ -90,7 +92,34 @@ fun SettingsScreen(onOpenFolders: () -> Unit, vm: SettingsViewModel = hiltViewMo
             }
         }
         item {
-            Text("Liquid Player 1.0 • Seus arquivos nunca são copiados nem alterados.", style = MaterialTheme.typography.bodySmall,
+            Card("Atualizações") {
+                Text("Versão instalada: ${vm.currentVersion}", fontWeight = FontWeight.SemiBold)
+                Text(
+                    when (val u = updateState) {
+                        is UpdateState.Idle -> "Atualizar é opcional. Toque em \"Verificar agora\" quando quiser."
+                        is UpdateState.Checking -> "Verificando no GitHub…"
+                        is UpdateState.UpToDate -> "Você está na versão mais recente."
+                        is UpdateState.NotConfigured -> "Defina GITHUB_OWNER e GITHUB_REPO no build.gradle.kts para ativar."
+                        is UpdateState.Available -> "Versão ${u.info.versionName} disponível."
+                        is UpdateState.Downloading -> "Baixando… ${(u.progress * 100).toInt()}%"
+                        is UpdateState.Downloaded -> "Versão ${u.info.versionName} pronta para instalar."
+                        is UpdateState.Failed -> u.message
+                    },
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton({ vm.checkUpdates() }, enabled = updateState !is UpdateState.Checking && updateState !is UpdateState.Downloading) {
+                        Icon(Icons.Rounded.Refresh, null); Spacer(Modifier.width(6.dp)); Text("Verificar agora")
+                    }
+                    if (updateState is UpdateState.Available || updateState is UpdateState.Downloaded || updateState is UpdateState.Downloading) {
+                        Button({ vm.showUpdate() }) { Text("Ver atualização") }
+                    }
+                }
+                SwitchRow("Verificar automaticamente", "No máximo 1x por dia, ao abrir o app. Nunca instala sozinho.", s.autoCheckUpdates) { vm.set(PrefKeys.UPDATE_AUTO, it) }
+            }
+        }
+        item {
+            Text("Liquid Player ${vm.currentVersion} • Seus arquivos nunca são copiados nem alterados.", style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(8.dp))
         }
     }

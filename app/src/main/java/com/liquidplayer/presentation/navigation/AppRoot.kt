@@ -77,6 +77,9 @@ private fun AppContent(vm: AppViewModel) {
     val playlists by vm.allPlaylists.collectAsStateWithLifecycle()
     val pendingAdd by vm.pendingAdd.collectAsStateWithLifecycle()
     val scanDialog by vm.scanDialog.collectAsStateWithLifecycle()
+    val updateState by vm.updateState.collectAsStateWithLifecycle()
+    val updatePrompt by vm.updatePrompt.collectAsStateWithLifecycle()
+    val appContext = LocalContext.current
 
     val navController = rememberNavController()
     val backStack by navController.currentBackStackEntryAsState()
@@ -177,6 +180,13 @@ private fun AppContent(vm: AppViewModel) {
             AddToPlaylistDialog(playlists, vm::addPendingTo, vm::createPlaylistAndAdd, vm::dismissAdd)
         }
         scanDialog?.let { r -> ScanResultDialog(r, vm::dismissScan) { mode -> vm.createFromScan(r, mode) } }
+        if (updatePrompt) {
+            UpdateDialog(
+                state = updateState, currentVersion = vm.currentVersion,
+                onDownload = vm::downloadUpdate, onInstall = { vm.installUpdate(appContext) }, onCancel = vm::cancelDownload,
+                onLater = vm::dismissUpdatePrompt, onSkip = vm::skipUpdate, onOpenPage = { vm.openReleasePage(appContext) },
+            )
+        }
     }
 }
 

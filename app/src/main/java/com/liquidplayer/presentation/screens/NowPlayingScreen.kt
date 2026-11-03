@@ -260,8 +260,8 @@ private fun LyricsList(lyrics: Lyrics, positionFlow: Flow<Long>, onSeek: (Long) 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun QueuePanel(state: PlayerState, vm: PlayerViewModel) {
-    var items by remember { mutableStateOf(state.queue) }
-    LaunchedEffect(state.queue) { items = state.queue }
+    var items by remember { mutableStateOf(state.entries) }
+    LaunchedEffect(state.entries) { items = state.entries }
     val listState = rememberLazyListState()
     val reorder = rememberReorderableLazyListState(listState) { from, to ->
         if (from.index in items.indices && to.index in items.indices) {
@@ -270,25 +270,34 @@ private fun QueuePanel(state: PlayerState, vm: PlayerViewModel) {
         }
     }
     LaunchedEffect(Unit) { if (state.currentIndex >= 0) listState.scrollToItem(state.currentIndex) }
+    val queuedCount = items.count { it.queued }
 
     Column(Modifier.fillMaxSize().glass(RoundedCornerShape(28.dp), 0.6f)) {
         Row(Modifier.padding(start = 20.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text("Fila • ${items.size}", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            TextButton(vm::clearQueue) { Text("Limpar") }
+            Column(Modifier.weight(1f)) {
+                Text("Fila • ${items.size}", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    if (queuedCount > 0) "$queuedCount adicionada(s) por você tocam antes do restante"
+                    else "Adicione músicas à fila: elas tocam antes do restante da playlist",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (queuedCount > 0) TextButton(vm::clearQueue) { Text("Limpar fila") }
         }
         Text(
-            "Arraste uma música para a esquerda para removê-la da fila.",
-            Modifier.padding(horizontal = 20.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            "Arraste para a esquerda para remover.",
+            Modifier.padding(horizontal = 20.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
         LazyColumn(state = listState) {
-            items(items, key = { it.id }) { song ->
-                ReorderableItem(reorder, key = song.id) { isDragging ->
-                    val index = items.indexOf(song)
+            items(items, key = { it.key }) { entry ->
+                ReorderableItem(reorder, key = entry.key) { isDragging ->
+                    val song = entry.song
+                    val index = items.indexOfFirst { it.key == entry.key }
                     val current = index == state.currentIndex
                     val dismissState = rememberSwipeToDismissBoxState(
                         confirmValueChange = { value ->
                             if (value == SwipeToDismissBoxValue.EndToStart) {
-                                val i = items.indexOf(song)
+                                val i = items.indexOfFirst { it.key == entry.key }
                                 if (i >= 0) {
                                     items = items.toMutableList().apply { removeAt(i) }
                                     vm.removeFromQueue(i)
@@ -300,13 +309,20 @@ private fun QueuePanel(state: PlayerState, vm: PlayerViewModel) {
                     val swiping = dismissState.dismissDirection != SwipeToDismissBoxValue.Settled
                     SwipeToDismissBox(
                         state = dismissState,
-                        enableDismissFromStartToEnd = false, // já está na fila
+                        enableDismissFromStartToEnd = false, // já está na lista
                         backgroundContent = { SwipeBackground(dismissState.dismissDirection) },
                     ) {
                         Row(
                             Modifier.fillMaxWidth()
-                                .background(if (isDragging || swiping) MaterialTheme.colorScheme.surfaceVariant else Color.Transparent)
-                                .clickable { vm.skipTo(items.indexOf(song)) }.padding(horizontal = 12.dp, vertical = 6.dp),
+                                .background(
+                                    when {
+                                        isDragging || swiping -> MaterialTheme.colorScheme.surfaceVariant
+                                        entry.queued -> MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
+                                        else -> Color.Transparent
+                                    },
+                                )
+                                .clickable { vm.skipTo(items.indexOfFirst { it.key == entry.key }) }
+                                .padding(horizontal = 12.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Artwork(song.artworkPath, Modifier.size(44.dp), RoundedCornerShape(10.dp))
@@ -314,10 +330,14 @@ private fun QueuePanel(state: PlayerState, vm: PlayerViewModel) {
                             Column(Modifier.weight(1f)) {
                                 Text(song.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold,
                                     color = if (current) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface)
-                                Text(song.artist, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    if (entry.queued) "Na fila • ${song.artist}" else song.artist,
+                                    maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+                                    color = if (entry.queued) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
                             }
                             if (current) Icon(Icons.Rounded.GraphicEq, "Tocando agora", tint = MaterialTheme.colorScheme.primary)
-                            IconButton({ vm.removeFromQueue(items.indexOf(song)) }) { Icon(Icons.Rounded.Close, "Remover da fila") }
+                            IconButton({ vm.removeFromQueue(items.indexOfFirst { it.key == entry.key }) }) { Icon(Icons.Rounded.Close, "Remover da fila") }
                             Icon(Icons.Rounded.DragHandle, "Reordenar", Modifier.draggableHandle().padding(6.dp))
                         }
                     }

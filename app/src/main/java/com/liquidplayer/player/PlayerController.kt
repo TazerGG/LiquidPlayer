@@ -47,8 +47,15 @@ import kotlin.random.Random
 
 /**
  * Ponte entre a UI e o PlaybackService (via MediaController).
- * A fila é a própria playlist do player — por isso é independente de qual playlist está aberta na UI.
- * A fila, a faixa atual e a posição são salvas no Room para serem restauradas ao reabrir o app.
+ *
+ * A lista do player tem duas camadas, como no Spotify:
+ *  - FILA DO USUÁRIO: músicas adicionadas manualmente. Ficam logo depois da música atual e tocam ANTES do contexto.
+ *    Aceitam qualquer música (mesmo já presente na playlist) e podem se repetir.
+ *  - CONTEXTO: a playlist/álbum/lista que está tocando.
+ * Cada entrada tem um mediaId único: "<songId>" (contexto) ou "<songId>#q<n>" (fila do usuário).
+ *
+ * O embaralhar é feito pelo app (o ExoPlayer fica sempre com shuffle desligado), para que a fila do usuário
+ * continue tocando em primeiro lugar mesmo com o modo aleatório ativo.
  */
 @Singleton
 class PlayerController @Inject constructor(
@@ -63,10 +70,13 @@ class PlayerController @Inject constructor(
     private var controller: MediaController? = null
     private var connecting = false
     private val songCache = ConcurrentHashMap<Long, Song>()
-    private var cachedQueue: List<Song> = emptyList()
+    private var cachedEntries: List<QueueEntry> = emptyList()
     private var lastLoggedId = -1L
     private var persistJob: Job? = null
     private var queueDirty = false
+    private var shuffleOn = false
+    private var originalOrder: List<String> = emptyList() // chaves do contexto na ordem original
+    private var queuedCounter = 0L
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val _state = MutableStateFlow(PlayerState())
@@ -94,8 +104,10 @@ class PlayerController @Inject constructor(
     private val listener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             val timelineChanged = events.containsAny(Player.EVENT_TIMELINE_CHANGED)
+            val transition = events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)
             if (timelineChanged) queueDirty = true
-            refresh(rebuildQueue = timelineChanged)
+            if (transition) removePlayedQueued()
+            refresh(rebuildQueue = timelineChanged || transition)
             schedulePersist()
         }
 
@@ -103,6 +115,12 @@ class PlayerController @Inject constructor(
             _events.tryEmit("Não foi possível reproduzir \"${_state.value.currentSong?.title ?: "o arquivo"}\".")
         }
     }
+
+    // ------------------------------------------------------------------ chaves da fila
+    private fun songIdOf(mediaId: String): Long = mediaId.substringBefore('#').toLongOrNull() ?: -1L
+    private fun isQueued(mediaId: String): Boolean = mediaId.contains('#')
+    private fun mediaIdAt(c: MediaController, i: Int): String = c.getMediaItemAt(i).mediaId
+    private fun Song.toQueuedItem(): MediaItem = toMediaItem().buildUpon().setMediaId("$id#q${++queuedCounter}").build()
 
     // ------------------------------------------------------------------ conexão
     fun connect() {
@@ -114,6 +132,7 @@ class PlayerController @Inject constructor(
             connecting = false
             val c = try { future.get() } catch (e: Exception) { null } ?: return@addListener
             controller = c
+            c.shuffleModeEnabled = false // o embaralhar é do app
             c.addListener(listener)
             scope.launch {
                 restoreIfNeeded(c)
@@ -128,37 +147,50 @@ class PlayerController @Inject constructor(
         if (!settings.current().restoreQueue) return
         val saved = queueDao.getAll()
         if (saved.isEmpty()) return
-        val byId = songDao.getByIds(saved.map { it.songId }).associateBy { it.id }
-        val songs = saved.mapNotNull { byId[it.songId] }.filter { it.isAvailable }.map { it.toDomain() }
-        if (songs.isEmpty()) return
-        songs.forEach { songCache[it.id] = it }
-        val currentId = settings.get(PrefKeys.PLAYER_INDEX_SONG)?.toLongOrNull()
-        val index = songs.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
-        val position = if (songs[index].id == currentId) settings.get(PrefKeys.PLAYER_POSITION)?.toLongOrNull() ?: 0L else 0L
-        c.shuffleModeEnabled = settings.get(PrefKeys.PLAYER_SHUFFLE)?.toBooleanStrictOrNull() ?: false
-        c.repeatMode = settings.get(PrefKeys.PLAYER_REPEAT)?.let { runCatching { RepeatMode.valueOf(it) }.getOrNull() }
-            .let { it ?: RepeatMode.OFF }.toPlayerMode()
-        c.setMediaItems(songs.map { it.toMediaItem() }, index, position)
+        val byId = songDao.getByIds(saved.map { it.songId }.distinct()).associateBy { it.id }
+        val queuedPos = settings.get(PrefKeys.QUEUED_POSITIONS)?.split(',')?.mapNotNull { it.toIntOrNull() }?.toHashSet()
+            ?: hashSetOf()
+        val entries = saved.mapNotNull { q -> byId[q.songId]?.takeIf { it.isAvailable }?.toDomain()?.let { q.position to it } }
+        if (entries.isEmpty()) return
+        entries.forEach { songCache[it.second.id] = it.second }
+        val items = entries.map { (pos, song) -> if (pos in queuedPos) song.toQueuedItem() else song.toMediaItem() }
+
+        val savedIndex = settings.get(PrefKeys.PLAYER_INDEX)?.toIntOrNull()
+        val savedSongId = settings.get(PrefKeys.PLAYER_INDEX_SONG)?.toLongOrNull()
+        var index = entries.indexOfFirst { it.first == savedIndex && it.second.id == savedSongId }
+        if (index < 0) index = entries.indexOfFirst { it.second.id == savedSongId }
+        if (index < 0) index = 0
+        val position = if (entries[index].second.id == savedSongId) settings.get(PrefKeys.PLAYER_POSITION)?.toLongOrNull() ?: 0L else 0L
+
+        shuffleOn = settings.get(PrefKeys.PLAYER_SHUFFLE)?.toBooleanStrictOrNull() ?: false
+        originalOrder = settings.get(PrefKeys.ORIGINAL_ORDER)?.split(',')?.filter { it.isNotBlank() } ?: emptyList()
+        val repeat = settings.get(PrefKeys.PLAYER_REPEAT)?.let { runCatching { RepeatMode.valueOf(it) }.getOrNull() } ?: RepeatMode.OFF
+        c.repeatMode = repeat.toPlayerMode()
+        c.setMediaItems(items, index, position)
         c.prepare() // pausado: só toca quando o usuário apertar play
     }
 
     // ------------------------------------------------------------------ estado
     private fun refresh(rebuildQueue: Boolean) {
         val c = controller ?: return
-        if (rebuildQueue || cachedQueue.size != c.mediaItemCount) {
-            cachedQueue = List(c.mediaItemCount) { toSong(c.getMediaItemAt(it)) }
+        if (rebuildQueue || cachedEntries.size != c.mediaItemCount) {
+            cachedEntries = List(c.mediaItemCount) {
+                val item = c.getMediaItemAt(it)
+                QueueEntry(item.mediaId, toSong(item), isQueued(item.mediaId))
+            }
         }
         val index = c.currentMediaItemIndex
-        val current = cachedQueue.getOrNull(index)
+        val current = cachedEntries.getOrNull(index)?.song
         val duration = c.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: current?.durationMs ?: 0L
         _state.value = PlayerState(
             currentSong = current,
             isPlaying = c.isPlaying,
             isBuffering = c.playbackState == Player.STATE_BUFFERING,
             durationMs = duration,
-            queue = cachedQueue,
+            queue = cachedEntries.map { it.song },
+            entries = cachedEntries,
             currentIndex = if (current == null) -1 else index,
-            shuffle = c.shuffleModeEnabled,
+            shuffle = shuffleOn,
             repeat = when (c.repeatMode) {
                 Player.REPEAT_MODE_ALL -> RepeatMode.ALL
                 Player.REPEAT_MODE_ONE -> RepeatMode.ONE
@@ -173,7 +205,7 @@ class PlayerController @Inject constructor(
     }
 
     private fun toSong(item: MediaItem): Song {
-        val id = item.mediaId.toLongOrNull() ?: -1L
+        val id = songIdOf(item.mediaId)
         songCache[id]?.let { return it }
         val m = item.mediaMetadata
         return Song(
@@ -185,8 +217,24 @@ class PlayerController @Inject constructor(
         )
     }
 
-    // ------------------------------------------------------------------ reprodução
-    fun play(songs: List<Song>, startIndex: Int = 0, shuffle: Boolean? = null) {
+    /** Músicas completas (com URI) para reconstruir itens; busca no banco o que não estiver em cache. */
+    private suspend fun songsFor(ids: Set<Long>): Map<Long, Song> {
+        val missing = ids.filter { it > 0 && !songCache.containsKey(it) }
+        if (missing.isNotEmpty()) songDao.getByIds(missing).forEach { songCache[it.id] = it.toDomain() }
+        return ids.mapNotNull { id -> songCache[id]?.let { id to it } }.toMap()
+    }
+
+    // ------------------------------------------------------------------ reprodução (contexto)
+    /** Toca uma lista (playlist, álbum…) como NOVO contexto. A fila do usuário é substituída. */
+    fun play(songs: List<Song>, startIndex: Int = 0) = startPlayback(songs, startIndex, shuffleOn)
+
+    fun playShuffled(songs: List<Song>) {
+        val playable = songs.filter { it.isAvailable }
+        if (playable.isEmpty()) return play(songs)
+        startPlayback(playable, Random.nextInt(playable.size), true)
+    }
+
+    private fun startPlayback(songs: List<Song>, startIndex: Int, shuffle: Boolean) {
         val c = controller ?: return
         val playable = songs.filter { it.isAvailable }
         if (playable.isEmpty()) {
@@ -197,16 +245,18 @@ class PlayerController @Inject constructor(
         val startId = songs.getOrNull(startIndex)?.id
         val index = playable.indexOfFirst { it.id == startId }.coerceAtLeast(0)
         playable.forEach { songCache[it.id] = it }
-        c.setMediaItems(playable.map { it.toMediaItem() }, index, 0L)
-        shuffle?.let { c.shuffleModeEnabled = it }
+        val items = playable.map { it.toMediaItem() }
+        originalOrder = items.map { it.mediaId }
+        shuffleOn = shuffle
+        if (shuffle) {
+            val rest = items.filterIndexed { i, _ -> i != index }.shuffled()
+            c.setMediaItems(listOf(items[index]) + rest, 0, 0L)
+        } else {
+            c.setMediaItems(items, index, 0L)
+        }
         c.prepare()
         c.play()
-    }
-
-    fun playShuffled(songs: List<Song>) {
-        val playable = songs.filter { it.isAvailable }
-        if (playable.isEmpty()) return play(songs)
-        play(playable, Random.nextInt(playable.size), shuffle = true)
+        refresh(rebuildQueue = true)
     }
 
     fun togglePlayPause() {
@@ -224,9 +274,38 @@ class PlayerController @Inject constructor(
     fun previous() { controller?.seekToPrevious() }
     fun seekTo(positionMs: Long) { controller?.seekTo(positionMs) }
 
+    /** Embaralha só o que ainda vai tocar do contexto; a fila do usuário continua primeiro. Desligar restaura a ordem original. */
     fun toggleShuffle() {
         val c = controller ?: return
-        c.shuffleModeEnabled = !c.shuffleModeEnabled
+        shuffleOn = !shuffleOn
+        scope.launch {
+            if (shuffleOn) originalOrder = List(c.mediaItemCount) { mediaIdAt(c, it) }.filter { !isQueued(it) }
+            reorderUpcomingContext(c)
+            queueDirty = true
+            refresh(rebuildQueue = true)
+            schedulePersist()
+        }
+    }
+
+    private suspend fun reorderUpcomingContext(c: MediaController) {
+        val cur = c.currentMediaItemIndex
+        val count = c.mediaItemCount
+        if (cur < 0 || cur >= count - 1) return
+        val keys = (cur + 1 until count).map { mediaIdAt(c, it) }
+        val songs = songsFor(keys.map { songIdOf(it) }.toSet())
+        val queued = keys.filter { isQueued(it) }
+        val context = keys.filter { !isQueued(it) }
+        val order = originalOrder.withIndex().associate { it.value to it.index }
+        val newContext = if (shuffleOn) context.shuffled() else context.sortedBy { order[it] ?: Int.MAX_VALUE }
+        val ordered = queued + newContext
+        val items = ordered.mapNotNull { key ->
+            songs[songIdOf(key)]?.let { s ->
+                if (isQueued(key)) s.toMediaItem().buildUpon().setMediaId(key).build() else s.toMediaItem()
+            }
+        }
+        if (items.size != ordered.size) return // faltou algum arquivo: não mexe
+        if (c.mediaItemCount != count || c.currentMediaItemIndex != cur) return // a lista mudou enquanto esperávamos
+        c.replaceMediaItems(cur + 1, count, items)
     }
 
     fun cycleRepeat() {
@@ -238,57 +317,83 @@ class PlayerController @Inject constructor(
         }
     }
 
-    // ------------------------------------------------------------------ fila
+    // ------------------------------------------------------------------ fila do usuário
+    /** Primeira posição depois da música atual e das músicas que o usuário já enfileirou. */
+    private fun queuedInsertIndex(c: MediaController): Int {
+        var i = c.currentMediaItemIndex + 1
+        while (i < c.mediaItemCount && isQueued(mediaIdAt(c, i))) i++
+        return i
+    }
+
+    /** Adiciona ao FIM da fila do usuário. Funciona mesmo que a música já esteja na playlist em reprodução. */
     fun addToQueue(songs: List<Song>) {
         val c = controller ?: return
         val playable = songs.filter { it.isAvailable }
-        if (c.mediaItemCount == 0) return play(playable)
-        val present = List(c.mediaItemCount) { c.getMediaItemAt(it).mediaId }.toHashSet()
-        val fresh = playable.filter { it.id.toString() !in present }
-        if (fresh.isEmpty()) {
-            _events.tryEmit("Já está na fila.")
+        if (playable.isEmpty()) {
+            _events.tryEmit("Nenhuma música disponível para adicionar.")
             return
         }
-        fresh.forEach { songCache[it.id] = it }
-        c.addMediaItems(fresh.map { it.toMediaItem() })
-        _events.tryEmit(if (fresh.size == 1) "Adicionada à fila." else "${fresh.size} músicas adicionadas à fila.")
+        if (c.mediaItemCount == 0) return play(playable)
+        playable.forEach { songCache[it.id] = it }
+        c.addMediaItems(queuedInsertIndex(c), playable.map { it.toQueuedItem() })
+        _events.tryEmit(if (playable.size == 1) "Adicionada à fila." else "${playable.size} músicas adicionadas à fila.")
     }
 
+    /** "Tocar a seguir": entra na FRENTE da fila do usuário, logo depois da música atual. */
     fun playNext(song: Song) {
         val c = controller ?: return
         if (!song.isAvailable) return
         if (c.mediaItemCount == 0) return play(listOf(song))
         songCache[song.id] = song
-        val target = c.currentMediaItemIndex + 1
-        val existing = List(c.mediaItemCount) { c.getMediaItemAt(it).mediaId }.indexOf(song.id.toString())
-        when {
-            existing == c.currentMediaItemIndex -> return
-            existing >= 0 -> c.moveMediaItem(existing, if (existing < target) target - 1 else target)
-            else -> c.addMediaItem(target, song.toMediaItem())
-        }
+        c.addMediaItem(c.currentMediaItemIndex + 1, song.toQueuedItem())
         _events.tryEmit("Tocará a seguir.")
     }
 
-    fun removeFromQueue(index: Int) { controller?.removeMediaItem(index) }
-
-    /** Remove uma música da fila pelo id (usado no gesto de arrastar da direita para a esquerda). */
+    /** Remove da fila do usuário uma música que o usuário havia enfileirado (não mexe no contexto). */
     fun removeSongFromQueue(songId: Long) {
         val c = controller ?: return
-        val index = List(c.mediaItemCount) { c.getMediaItemAt(it).mediaId }.indexOf(songId.toString())
-        if (index < 0) {
-            _events.tryEmit("Esta música não está na fila.")
+        val index = (c.currentMediaItemIndex + 1 until c.mediaItemCount).firstOrNull {
+            val key = mediaIdAt(c, it)
+            isQueued(key) && songIdOf(key) == songId
+        }
+        if (index == null) {
+            _events.tryEmit("Esta música não está na sua fila.")
             return
         }
         c.removeMediaItem(index)
         _events.tryEmit("Removida da fila.")
     }
+
+    /** Remove qualquer entrada (da fila ou do contexto) pela posição — usado na aba "Fila". */
+    fun removeFromQueue(index: Int) { controller?.removeMediaItem(index) }
     fun moveQueueItem(from: Int, to: Int) { controller?.moveMediaItem(from, to) }
+
     fun skipToQueueItem(index: Int) {
         val c = controller ?: return
         c.seekTo(index, 0L)
         c.play()
     }
-    fun clearQueue() { controller?.clearMediaItems() }
+
+    /** Limpa só as músicas adicionadas pelo usuário; a playlist em reprodução continua. */
+    fun clearQueue() {
+        val c = controller ?: return
+        var removed = 0
+        for (i in c.mediaItemCount - 1 downTo 0) {
+            if (i != c.currentMediaItemIndex && isQueued(mediaIdAt(c, i))) {
+                c.removeMediaItem(i)
+                removed++
+            }
+        }
+        _events.tryEmit(if (removed == 0) "Nenhuma música adicionada por você na fila." else "Fila limpa ($removed).")
+    }
+
+    /** Músicas da fila do usuário já tocadas saem da lista (como no Spotify). */
+    private fun removePlayedQueued() {
+        val c = controller ?: return
+        for (i in c.currentMediaItemIndex - 1 downTo 0) {
+            if (isQueued(mediaIdAt(c, i))) c.removeMediaItem(i)
+        }
+    }
 
     // ------------------------------------------------------------------ volume (volume de mídia do aparelho)
     fun getVolume(): Float {
@@ -324,18 +429,28 @@ class PlayerController @Inject constructor(
     private suspend fun persistNow() {
         val c = controller ?: return
         if (queueDirty) {
-            val ids = List(c.mediaItemCount) { c.getMediaItemAt(it).mediaId.toLongOrNull() ?: -1L }.filter { it > 0 }
-            db.withTransaction {
-                queueDao.clear()
-                queueDao.insertAll(ids.mapIndexed { i, id -> QueueItemEntity(i, id) })
+            val keys = List(c.mediaItemCount) { mediaIdAt(c, it) }
+            val ids = keys.map { songIdOf(it) }.filter { it > 0 }
+            if (ids.size == keys.size) {
+                db.withTransaction {
+                    queueDao.clear()
+                    queueDao.insertAll(ids.mapIndexed { i, id -> QueueItemEntity(i, id) })
+                }
+                settings.setMany(
+                    mapOf(
+                        PrefKeys.QUEUED_POSITIONS to keys.withIndex().filter { isQueued(it.value) }.joinToString(",") { it.index.toString() },
+                        PrefKeys.ORIGINAL_ORDER to originalOrder.joinToString(","),
+                    ),
+                )
+                queueDirty = false
             }
-            queueDirty = false
         }
         settings.setMany(
             mapOf(
                 PrefKeys.PLAYER_INDEX_SONG to (_state.value.currentSong?.id ?: -1L),
+                PrefKeys.PLAYER_INDEX to c.currentMediaItemIndex,
                 PrefKeys.PLAYER_POSITION to c.currentPosition.coerceAtLeast(0L),
-                PrefKeys.PLAYER_SHUFFLE to c.shuffleModeEnabled,
+                PrefKeys.PLAYER_SHUFFLE to shuffleOn,
                 PrefKeys.PLAYER_REPEAT to _state.value.repeat.name,
             ),
         )
